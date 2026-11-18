@@ -28,6 +28,46 @@ This example is not a fully maintained product integration. Changes in LiteLLM o
 
 The example sends `flagOnly: false` to ScanAPI so blocking guardrails can return the `blocked` outcome. In this implementation, `flagged` is treated as a signal and `blocked` is treated as an enforcement decision.
 
+## Tracking the End User (externalMetadata)
+
+ScanAPI accepts an `externalMetadata` object and stores it with each scan. The guardrail can fill it
+from request headers that your application or gateway sets, so you can see who sent a prompt.
+
+```yaml
+guardrails:
+  - guardrail_name: f5-guardrail
+    litellm_params:
+      guardrail: f5_guardrail.f5Guardrail
+      mode: pre_call
+      default_on: true
+      api_key: os.environ/F5_GUARDRAILS_API_TOKEN
+      external_metadata_headers: ["x-user-id", "x-forwarded-for", "x-client-ip"]
+```
+
+Send the headers on the request to LiteLLM:
+
+```bash
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer anything" -H "Content-Type: application/json" \
+  -H "X-User-Id: alice@example.com" -H "X-Forwarded-For: 203.0.113.7" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "What is 2 + 2?"}]}'
+```
+
+The scan is then stored with:
+
+```json
+"externalMetadata": {"x-user-id": "alice@example.com", "x-forwarded-for": "203.0.113.7"}
+```
+
+Notes:
+
+- Nothing is sent unless `external_metadata_headers` is set. Names are case-insensitive.
+- Only headers you list are copied. `Authorization`, `Cookie` and `X-Api-Key` are never copied, even if listed.
+- Set these headers from something you trust (your app server or reverse proxy) after sign-in, and remove any value a client sends itself. Otherwise a user can claim to be someone else.
+- F5 records its own `userId` on a scan: the API token that made the call, not your end user.
+- You can read `externalMetadata` from `GET /backend/v1/scans/{id}` and from the scan list. The scan list cannot be searched or filtered by metadata, so filter on your side.
+- Scans with outcome `flagged` or `blocked` are stored with their metadata too. In our test a new flagged or blocked scan took 20 to 40 seconds to appear in the scan list, and could be read by ID immediately. Filter the list with `outcomes=blocked` or `outcomes=flagged`; they are separate values.
+
 ## Where to Scan
 
 F5 AI Security ScanAPI can be invoked at multiple points in an AI workflow:

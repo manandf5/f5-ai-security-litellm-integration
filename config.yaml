@@ -15,3 +15,6 @@ guardrails:
       api_key: os.environ/F5_GUARDRAILS_API_TOKEN
       api_base: https://www.us1.calypsoai.app/backend/v1
       flag_only: false
+      # Optional: copy these request headers into ScanAPI externalMetadata so scans
+      # can be traced to an end user. Your gateway must set them after authentication.
+      # external_metadata_headers: ["x-user-id", "x-forwarded-for"]

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.llms.custom_httpx.http_handler import (
@@ -29,6 +29,7 @@ class f5Guardrail(CustomGuardrail):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         flag_only: Optional[Union[bool, str]] = None,
+        external_metadata_headers: Optional[Union[List[str], str]] = None,
         **kwargs,
     ):
         # LiteLLM passes values from config.yaml; env vars keep local runs simple.
@@ -39,6 +40,10 @@ class f5Guardrail(CustomGuardrail):
         ) or "https://www.us1.calypsoai.app/backend/v1"
         # flagOnly=false lets ScanAPI return blocking decisions as "blocked".
         self.flag_only = self._resolve_flag_only(flag_only)
+        # Request headers copied into ScanAPI externalMetadata (for example the
+        # end-user ID or client IP set by your gateway). Empty by default, so
+        # nothing is sent unless you list headers in config.yaml.
+        self.external_metadata_headers = self._resolve_header_names(external_metadata_headers)
         super().__init__(**kwargs)
 
     @staticmethod
@@ -56,13 +61,37 @@ class f5Guardrail(CustomGuardrail):
             return flag_only.lower() in ("1", "true", "yes", "on")
         return flag_only
 
+    # Never copy credentials into scan metadata, even if listed by mistake.
+    _NEVER_FORWARD = frozenset({"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"})
+
+    @staticmethod
+    def _resolve_header_names(value: Optional[Union[List[str], str]]) -> List[str]:
+        # Accept a YAML list or a comma-separated string (for example from an env var).
+        if not value:
+            return []
+        if isinstance(value, str):
+            value = value.split(",")
+        return [name.strip().lower() for name in value if isinstance(name, str) and name.strip()]
+
+    def _build_external_metadata(self, request_data: Optional[dict]) -> Dict[str, str]:
+        # LiteLLM exposes the incoming request headers (lower-case names) here.
+        if not self.external_metadata_headers or not isinstance(request_data, dict):
+            return {}
+        headers = (request_data.get("proxy_server_request") or {}).get("headers") or {}
+        headers = {str(k).lower(): v for k, v in headers.items()}
+        return {
+            name: str(headers[name])
+            for name in self.external_metadata_headers
+            if name not in self._NEVER_FORWARD and headers.get(name)
+        }
+
     async def apply_guardrail(
         self,
         *args: Any,
         text: Optional[str] = None,
         language: Optional[str] = None,  # unused
         entities: Optional[List[PiiEntityType]] = None,  # unused
-        request_data: Optional[dict] = None,  # unused
+        request_data: Optional[dict] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -74,12 +103,13 @@ class f5Guardrail(CustomGuardrail):
         inputs = kwargs.get("inputs")
         if inputs is None and args and isinstance(args[0], dict):
             inputs = args[0]
+        external_metadata = self._build_external_metadata(request_data)
 
         if isinstance(inputs, dict):
             texts = inputs.get("texts")
             if isinstance(texts, list):
                 inputs["texts"] = [
-                    await self._scan_text(text_to_scan)
+                    await self._scan_text(text_to_scan, external_metadata)
                     if isinstance(text_to_scan, str) and text_to_scan
                     else text_to_scan
                     for text_to_scan in texts
@@ -93,10 +123,10 @@ class f5Guardrail(CustomGuardrail):
         if not text:
             return text
 
-        return await self._scan_text(text)
+        return await self._scan_text(text, external_metadata)
 
-    async def _scan_text(self, text: str) -> str:
-        response_data = await self._check_with_api(text)
+    async def _scan_text(self, text: str, external_metadata: Optional[Dict[str, str]] = None) -> str:
+        response_data = await self._check_with_api(text, external_metadata)
         return self._apply_scan_result(text=text, response_data=response_data)
 
     def _apply_scan_result(self, text: str, response_data: dict) -> str:
@@ -137,12 +167,16 @@ class f5Guardrail(CustomGuardrail):
                 return str(reason)
         return response_data.get("reason") or f"Policy violation: {outcome}"
 
-    async def _check_with_api(self, text: str) -> dict:
+    async def _check_with_api(self, text: str, external_metadata: Optional[Dict[str, str]] = None) -> dict:
         async_client = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.LoggingCallback
         )
         if not self.api_key:
             raise Exception("F5_GUARDRAILS_API_TOKEN is not configured")
+
+        payload: Dict[str, Any] = {"input": text, "flagOnly": self.flag_only}
+        if external_metadata:
+            payload["externalMetadata"] = external_metadata
 
         response = await async_client.post(
             f"{self.api_base}/scans",
@@ -150,7 +184,7 @@ class f5Guardrail(CustomGuardrail):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
             },
-            json={"input": text, "flagOnly": self.flag_only},
+            json=payload,
             timeout=30,
         )
         response.raise_for_status()
