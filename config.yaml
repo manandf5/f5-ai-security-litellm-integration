@@ -17,4 +17,8 @@ guardrails:
       flag_only: false
       # Optional: copy these request headers into ScanAPI externalMetadata so scans
       # can be traced to an end user. Your gateway must set them after authentication.
+      # Optional: what the caller receives when a prompt is blocked.
+      #   error (default): HTTP 400.  message: HTTP 200 with block_message as the reply.
+      # block_response_mode: message
+      # block_message: "This request was blocked by your organisation's AI usage policy."
       # external_metadata_headers: ["x-user-id", "x-forwarded-for"]

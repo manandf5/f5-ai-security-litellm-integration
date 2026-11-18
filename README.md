@@ -68,6 +68,33 @@ Notes:
 - You can read `externalMetadata` from `GET /backend/v1/scans/{id}` and from the scan list. The scan list cannot be searched or filtered by metadata, so filter on your side.
 - Scans with outcome `flagged` or `blocked` are stored with their metadata too. In our test a new flagged or blocked scan took 20 to 40 seconds to appear in the scan list, and could be read by ID immediately. Filter the list with `outcomes=blocked` or `outcomes=flagged`; they are separate values.
 
+## What the End User Sees When a Prompt Is Blocked
+
+When ScanAPI returns `blocked`, the guardrail stops the request before it reaches the model.
+Choose how the caller is told with `block_response_mode`:
+
+| `block_response_mode` | Response to the caller | Use when |
+| --- | --- | --- |
+| `error` (default) | HTTP 400, `invalid_request_error`, with the message | Your application handles API errors and shows its own text |
+| `message` | HTTP 200, an assistant message with `block_message` as the text | You want a chat UI to show a clean policy message with no application change |
+
+```yaml
+      block_response_mode: message
+      block_message: "This request was blocked by your organisation's AI usage policy. Please rephrase and try again."
+```
+
+Notes:
+
+- Earlier versions raised a plain `Exception`, which LiteLLM returns as HTTP 500 `internal_server_error`.
+  Many applications treat 5xx as an outage, so the user saw a generic system error. Blocks now use
+  LiteLLM's `GuardrailRaisedException` (400) or `ModifyResponseException` (200).
+- `block_message` is optional. Without it, the message is F5's reason, or `Policy violation: blocked`.
+- In `message` mode a non-streaming reply has `finish_reason: "content_filter"` and a streamed reply ends
+  with `finish_reason: "stop"`. Do not rely on `finish_reason` alone to detect a block when streaming.
+- Failures to scan (F5 unreachable, bad token, unexpected outcome) are still errors and still fail closed.
+  They are never shown as a policy block.
+- `flagged` scans are still allowed to continue; only `blocked` is stopped.
+
 ## Where to Scan
 
 F5 AI Security ScanAPI can be invoked at multiple points in an AI workflow:

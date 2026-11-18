@@ -15,6 +15,7 @@
 import os
 from typing import Any, Dict, List, Optional, Union
 
+from litellm.exceptions import GuardrailRaisedException, ModifyResponseException
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
@@ -30,6 +31,8 @@ class f5Guardrail(CustomGuardrail):
         api_base: Optional[str] = None,
         flag_only: Optional[Union[bool, str]] = None,
         external_metadata_headers: Optional[Union[List[str], str]] = None,
+        block_response_mode: Optional[str] = None,
+        block_message: Optional[str] = None,
         **kwargs,
     ):
         # LiteLLM passes values from config.yaml; env vars keep local runs simple.
@@ -44,6 +47,13 @@ class f5Guardrail(CustomGuardrail):
         # end-user ID or client IP set by your gateway). Empty by default, so
         # nothing is sent unless you list headers in config.yaml.
         self.external_metadata_headers = self._resolve_header_names(external_metadata_headers)
+        # What the caller receives when ScanAPI returns "blocked":
+        #   error   (default) HTTP 400 with the message, as a guardrail block
+        #   message           HTTP 200 with block_message as the assistant reply
+        self.block_response_mode = (block_response_mode or "error").strip().lower()
+        if self.block_response_mode not in ("error", "message"):
+            raise ValueError("block_response_mode must be 'error' or 'message'")
+        self.block_message = block_message
         super().__init__(**kwargs)
 
     @staticmethod
@@ -109,7 +119,7 @@ class f5Guardrail(CustomGuardrail):
             texts = inputs.get("texts")
             if isinstance(texts, list):
                 inputs["texts"] = [
-                    await self._scan_text(text_to_scan, external_metadata)
+                    await self._scan_text(text_to_scan, external_metadata, request_data)
                     if isinstance(text_to_scan, str) and text_to_scan
                     else text_to_scan
                     for text_to_scan in texts
@@ -123,13 +133,18 @@ class f5Guardrail(CustomGuardrail):
         if not text:
             return text
 
-        return await self._scan_text(text, external_metadata)
+        return await self._scan_text(text, external_metadata, request_data)
 
-    async def _scan_text(self, text: str, external_metadata: Optional[Dict[str, str]] = None) -> str:
+    async def _scan_text(
+        self,
+        text: str,
+        external_metadata: Optional[Dict[str, str]] = None,
+        request_data: Optional[dict] = None,
+    ) -> str:
         response_data = await self._check_with_api(text, external_metadata)
-        return self._apply_scan_result(text=text, response_data=response_data)
+        return self._apply_scan_result(text=text, response_data=response_data, request_data=request_data)
 
-    def _apply_scan_result(self, text: str, response_data: dict) -> str:
+    def _apply_scan_result(self, text: str, response_data: dict, request_data: Optional[dict] = None) -> str:
         # ScanAPI returns result.outcome as the normalized policy decision.
         result = response_data.get("result")
         if not isinstance(result, dict):
@@ -152,11 +167,33 @@ class f5Guardrail(CustomGuardrail):
         # blocked is returned when ScanAPI evaluates a blocking guardrail with
         # flagOnly=false. Stop the request before it reaches the model.
         if outcome == "blocked":
-            raise Exception(self._policy_violation_message(response_data, outcome))
+            self._raise_blocked(response_data, outcome, request_data)
 
         # Unknown or missing outcomes fail closed so ScanAPI changes do not
         # silently allow untrusted input through to the model.
         raise Exception(f"Unexpected or missing F5 Guardrails outcome: {outcome}")
+
+    def _raise_blocked(self, response_data: dict, outcome: Any, request_data: Optional[dict]) -> None:
+        # block_message (if set) is what the end user sees; otherwise use F5's reason.
+        reason = self._policy_violation_message(response_data, outcome)
+        user_message = self.block_message or reason
+        if self.block_response_mode == "message":
+            raise ModifyResponseException(
+                message=user_message,
+                model=(request_data or {}).get("model", ""),
+                request_data=request_data or {},
+                guardrail_name=self.guardrail_name,
+                detection_info={"scan_id": response_data.get("id"), "outcome": outcome},
+            )
+        # A clean 4xx guardrail block instead of an unhandled 500. blocked_content marks
+        # that ScanAPI reached a verdict (as opposed to being unreachable).
+        raise GuardrailRaisedException(
+            guardrail_name=self.guardrail_name,
+            message=user_message,
+            should_wrap_with_default_message=False,
+            status_code=400,
+            blocked_content=True,
+        )
 
     @staticmethod
     def _policy_violation_message(response_data: dict, outcome: Any) -> str:
